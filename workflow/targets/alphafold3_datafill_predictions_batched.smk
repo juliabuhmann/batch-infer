@@ -144,16 +144,18 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             SMKDIR=`pwd`
             echo BATCH: {params.alphafold3_ids}
             echo BATCH_EST_MIN: {params.est_min}
-            mkdir -p $TMPDIR/alphafold3_msas
+            mkdir -p $TMPDIR/alphafold3_msas $TMPDIR/alphafold3_jsons_batch
             ALPHAFOLD3_IDS="{params.alphafold3_ids}"
             for ALPHAFOLD3_ID in $ALPHAFOLD3_IDS; do
                 echo ALPHAFOLD3_ID: "$ALPHAFOLD3_ID"
-                JSON=alphafold3_jsons/"$ALPHAFOLD3_ID".json
-                echo JSON: "$JSON"
-                OUTPUT_DIR="$TMPDIR"/alphafold3_msas/
-                echo OUTPUT_DIR: "$OUTPUT_DIR"
-                af3io data-fill {params.data_sources} --data_dir=alphafold3_msas --json_path="$JSON" --output_dir="$OUTPUT_DIR"
+                ln -sfn $SMKDIR/alphafold3_jsons/"$ALPHAFOLD3_ID".json $TMPDIR/alphafold3_jsons_batch/"$ALPHAFOLD3_ID".json
             done
+            # ONE af3io call for the whole batch (--input_dir over the staged links): the data index is built once per
+            # job, not once per pool -- a cache directory without .af3io_data_index.json is re-read on every call
+            # (688 files, ~1 min each in the first batched run), which the one-pool target hides and a batch multiplies.
+            echo FILL_START: `date -Is`
+            af3io data-fill {params.data_sources} --data_dir=alphafold3_msas --input_dir=$TMPDIR/alphafold3_jsons_batch --output_dir=$TMPDIR/alphafold3_msas/
+            echo FILL_END: `date -Is`
             ls -l $TMPDIR/alphafold3_msas
 
             mkdir -p $TMPDIR/alphafold3_predictions
