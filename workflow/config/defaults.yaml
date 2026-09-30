@@ -57,6 +57,8 @@ alphafold3:
     threads: 4
     # a pool is zipped beside the running container once its <id>_ranking_scores.csv is this old (seconds)
     zip_settle_s: 30
+    # false: no zipping beside the container (the rule of the first batched runs); a control switch
+    early_zip: true
   summary_ipsae:
     pae_cutoff: 10
     dist_cutoff: 10

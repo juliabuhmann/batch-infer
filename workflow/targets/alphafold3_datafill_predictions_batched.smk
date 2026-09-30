@@ -23,6 +23,7 @@ Config (workflow/config/defaults.yaml `alphafold3.predictions_batched`, overrida
   runtime_table_s    [[tokens, seconds], ...]: per-pool wall time of the engine in a multi-pool process, linearly
                      interpolated (flat outside the table) -- measure it per engine/card
   disk_mb_per_pool, disk_mb_min   local scratch: filled input (~0.3 GB) + outputs (~1.1 GB) + caches, per pool
+  early_zip          true (default) | false: zip only after the container exits, as the first batched runs did
   threads            CPU cores of a batch job (sbatch --ntasks; mem_mb is split over them). The one-pool target runs
                      on 1 core; the kit runs featurisation and the write-behind writer as separate processes beside
                      the model process, and the early zipper below adds one more -- 4 by default (gain UNMEASURED).
@@ -143,6 +144,7 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             alphafold3_ids = ' '.join(df_batch.id.tolist()),
             est_min = round(df_batch.runtime_s.sum() / 60, 1),
             zip_settle_s = int(CFG_B.get('zip_settle_s', 30)),
+            early_zip = int(bool(CFG_B.get('early_zip', True))),
             data_sources = config['alphafold3']['data_sources'],
             singularity_args = config['alphafold3']['predictions']['singularity_args'],
             container = config['alphafold3']['container'],
@@ -215,6 +217,7 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             ZIPPED_LIST=$TMPDIR/zipped_early.txt
             : > $ZIPPED_LIST
             ( set +e; cd $TMPDIR/alphafold3_predictions
+              [ "{params.early_zip}" = 1 ] || exit 0    # early_zip: false -> zip everything after the container (control runs)
               while true; do
                   for ALPHAFOLD3_ID in $TODO_IDS; do
                       grep -qx "$ALPHAFOLD3_ID" $ZIPPED_LIST && continue
