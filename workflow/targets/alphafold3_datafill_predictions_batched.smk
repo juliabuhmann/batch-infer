@@ -1,10 +1,10 @@
 """
 alphafold3_datafill_predictions with N pools per GPU job.
 
-Same flow as alphafold3_datafill_predictions.smk (af3io data-fill per pool on the node, one container call, one zip per
-pool) but the pools are packed into jobs by predicted runtime instead of one pool per job. The rule body there was
-already written for a batch (loops over ALPHAFOLD3_IDS, --input_dir); only its batch function was a placeholder
-("Mock partitioning to run one pool per job for now").
+Same flow as alphafold3_datafill_predictions.smk (af3io data-fill on the node, one container call, one zip per pool) but
+the pools are packed into jobs by predicted runtime instead of one pool per job. The rule body there was already
+written for a batch (loops over ALPHAFOLD3_IDS, --input_dir); only its batch function was a placeholder ("Mock
+partitioning to run one pool per job for now").
 
 Written for Anthropic's af3_torch optimization kit (run_alphafold_wrapper + singularity_args of the run config; the kit
 loads the model once per process and overlaps featurisation/writing of one item with the GPU on another, measured
@@ -13,9 +13,8 @@ once per pool). Engine-agnostic otherwise: the container takes --input_dir like 
 
 Config (workflow/config/defaults.yaml `alphafold3.predictions_batched`, overridable per run):
   runtime            SLURM time limit of a batch job
-  budget_hrs         sum of predicted pool runtimes per job (plus job_overhead_s) -- keep well below `runtime`:
-                     the zips are written only after the container exits, so a job that hits its time limit loses
-                     EVERY pool of the batch (its outputs sit on the node's local scratch)
+  budget_hrs         sum of predicted pool runtimes per job (plus job_overhead_s) -- keep below `runtime`: a job cut by
+                     its time limit loses the pool in flight and every pool not yet zipped (see "zips" below)
   job_overhead_s     once per job: container start, imports, model load, cold compile
   max_pools_per_job  hard cap on the batch length
   tokens_min/max     pools outside are refused (listed in <tsv>.refused) -- e.g. the kit's memory reach on a card
@@ -24,18 +23,30 @@ Config (workflow/config/defaults.yaml `alphafold3.predictions_batched`, overrida
   runtime_table_s    [[tokens, seconds], ...]: per-pool wall time of the engine in a multi-pool process, linearly
                      interpolated (flat outside the table) -- measure it per engine/card
   disk_mb_per_pool, disk_mb_min   local scratch: filled input (~0.3 GB) + outputs (~1.1 GB) + caches, per pool
+  threads            CPU cores of a batch job (sbatch --ntasks; mem_mb is split over them). The one-pool target runs
+                     on 1 core; the kit runs featurisation and the write-behind writer as separate processes beside
+                     the model process, and the early zipper below adds one more -- 4 by default (gain UNMEASURED).
 
 Batches are cached in alphafold3_predictions/.alphafold3_datafill_predictions_batched.tsv on first use, like the
-one-pool target's list: delete it (or re-run the staging stage) after inputs or zips change.
+one-pool target's list: delete it (or re-run the staging stage) after inputs or zips change. The next `batch-infer
+start` then re-batches the pools that still have no zip.
 
-Per-pool failure: the container exits non-zero when any item failed (Anthropic's kits do; stock run_alphafold.py
-stops at the first). The rule tolerates that and zips every pool that has a summary; a pool without a zip is what
-marks a failure, and re-running the target re-batches the pools still missing a zip -- batch-infer's resume model.
-The rule's declared output is therefore a per-batch marker (alphafold3_predictions/.batched/batch<N>.done, listing
-each pool's status), NOT the zips: snakemake removes the outputs of a failed job, which would delete the finished
-pools' zips along with the failed pool's.
+Zips: a pool is zipped AS SOON AS its output is complete (a watcher beside the container zips every pool whose
+<id>_ranking_scores.csv -- the last file AlphaFold 3's write_outputs writes -- has been untouched for
+ZIP_SETTLE_S seconds), and once more for whatever is left after the container exits. So a job that hits its time
+limit keeps the pools it finished; only the pool in flight (and the ones the watcher had not reached) are lost and
+re-batched by the next run. Pools that already have a zip when the job starts (a stale batch list) are skipped.
 
-STATUS 2026-09-30: written on the branch add-anthropic-kit-support; not yet run.
+Per-pool failure: the container exits non-zero when any item failed (Anthropic's kits account every item and go on
+to the next; stock run_alphafold.py stops at the first). The rule tolerates that; a pool without a zip is what marks
+a failure, and re-running the target re-batches the pools still missing a zip -- batch-infer's resume model. The
+rule's declared output is therefore a per-batch marker (alphafold3_predictions/.batched/batch<N>_<digest>.done,
+listing each pool's status), NOT the zips: snakemake removes the outputs of a failed job, which would delete the
+finished pools' zips along with the failed pool's. <digest> is a hash of the batch's pool ids, so a batch list
+regenerated after a partial run (batch numbers start at 0 again, over other pools) never matches an old marker.
+
+STATUS 2026-09-30: batch packing and the one-container-per-batch flow ran (8 pools, job 15714071; 1 + 19 + 19 pools,
+jobs 15721990/88/89). The early zipper, the zip-exists skip, the digest markers and `threads` are NOT yet run.
 """
 
 include: '../rules/common.smk'
@@ -63,6 +74,13 @@ def runtime_s_(tokens):
     tab = np.array(CFG_B['runtime_table_s'], dtype=float)
     tab = tab[np.argsort(tab[:, 0])]
     return float(np.interp(tokens, tab[:, 0], tab[:, 1]))
+
+
+def batch_marker_(batch_id, ids_):
+    """alphafold3_predictions/.batched/batch<N>_<digest>.done -- the digest ties the marker to the batch's pool ids."""
+    import hashlib
+    digest_ = hashlib.sha1(' '.join(ids_).encode()).hexdigest()[:8]
+    return f'{MARK_DIR_}/batch{batch_id}_{digest_}.done'
 
 
 def make_runtime_batches_():
@@ -106,21 +124,25 @@ def make_runtime_batches_():
 
 batches_ = make_runtime_batches_()
 ids = batches_.id.tolist()
+markers_ = []
 
 for batch_id, df_batch in batches_.groupby('batch_id'):
     n_pools_ = len(df_batch)
+    marker_ = batch_marker_(batch_id, df_batch.id.tolist())
+    markers_.append(marker_)
 
-    rule:  # N pools of the batch: fill each, one container call over all, one zip per pool
+    rule:  # N pools of the batch: fill all, one container call over all, one zip per pool (early, then the rest)
         name:
             f'alphafold3_datafill_predictions_batched{batch_id}_{n_pools_}'
         input:
             json = expand('alphafold3_jsons/{id}.json', id=df_batch.id.tolist()),
         output:
-            done = f'{MARK_DIR_}/batch{batch_id}.done',
+            done = marker_,
         params:
             activate = root_path('.venv/bin/activate'),
             alphafold3_ids = ' '.join(df_batch.id.tolist()),
             est_min = round(df_batch.runtime_s.sum() / 60, 1),
+            zip_settle_s = int(CFG_B.get('zip_settle_s', 30)),
             data_sources = config['alphafold3']['data_sources'],
             singularity_args = config['alphafold3']['predictions']['singularity_args'],
             container = config['alphafold3']['container'],
@@ -133,6 +155,7 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             run_alphafold_args = f"--norun_data_pipeline {config['alphafold3']['predictions']['run_alphafold_args']}",
             run_alphafold_dirs = '--input_dir=/root/af_input --output_dir=/root/af_output --model_dir=/root/models --db_dir=/root/public_databases',
         retries: config['alphafold3']['predictions']['retries']
+        threads: int(CFG_B.get('threads', 4))
         resources:
             runtime = CFG_B['runtime'],
             mem_mb = config['alphafold3']['predictions']['mem_mb'],
@@ -144,9 +167,26 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             SMKDIR=`pwd`
             echo BATCH: {params.alphafold3_ids}
             echo BATCH_EST_MIN: {params.est_min}
+            MARKER_TMP=$SMKDIR/{output.done}.tmp
+            : > $MARKER_TMP
+
+            # pools that already have a zip (a batch list older than the zips) are not run again
+            TODO_IDS=""
+            for ALPHAFOLD3_ID in {params.alphafold3_ids}; do
+                if [ -f $SMKDIR/alphafold3_predictions/"$ALPHAFOLD3_ID".zip ]; then
+                    echo "POOL_STATUS $ALPHAFOLD3_ID already_zipped" | tee -a $MARKER_TMP
+                else
+                    TODO_IDS="$TODO_IDS $ALPHAFOLD3_ID"
+                fi
+            done
+            if [ -z "$TODO_IDS" ]; then
+                echo BATCH_DONE: ok=0 of 0 "(every pool already zipped)"
+                mv $MARKER_TMP $SMKDIR/{output.done}
+                exit 0
+            fi
+
             mkdir -p $TMPDIR/alphafold3_msas $TMPDIR/alphafold3_jsons_batch
-            ALPHAFOLD3_IDS="{params.alphafold3_ids}"
-            for ALPHAFOLD3_ID in $ALPHAFOLD3_IDS; do
+            for ALPHAFOLD3_ID in $TODO_IDS; do
                 echo ALPHAFOLD3_ID: "$ALPHAFOLD3_ID"
                 ln -sfn $SMKDIR/alphafold3_jsons/"$ALPHAFOLD3_ID".json $TMPDIR/alphafold3_jsons_batch/"$ALPHAFOLD3_ID".json
             done
@@ -163,47 +203,77 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             cd $TMPDIR
             echo Contents of $TMPDIR
             ls -l $TMPDIR
+
+            # zip_pool <id>: cwd $TMPDIR/alphafold3_predictions; the filled input copy is dropped, the zip lands atomically
+            zip_pool() {{
+                [ -f "$1"/"$1"_data.json ] && rm "$1"/"$1"_data.json
+                zip -q -r $SMKDIR/alphafold3_predictions/"$1".zip.tmp "$1" \\
+                    && mv $SMKDIR/alphafold3_predictions/"$1".zip.tmp $SMKDIR/alphafold3_predictions/"$1".zip
+            }}
+            # early zipper: beside the container, a pool is zipped once its <id>_ranking_scores.csv (the last file of
+            # AlphaFold 3's write_outputs) has sat untouched for zip_settle_s; ZIPPED_EARLY lines name them
+            ZIPPED_LIST=$TMPDIR/zipped_early.txt
+            : > $ZIPPED_LIST
+            ( set +e; cd $TMPDIR/alphafold3_predictions
+              while true; do
+                  for ALPHAFOLD3_ID in $TODO_IDS; do
+                      grep -qx "$ALPHAFOLD3_ID" $ZIPPED_LIST && continue
+                      RANK="$ALPHAFOLD3_ID"/"$ALPHAFOLD3_ID"_ranking_scores.csv
+                      [ -f "$RANK" ] && [ -f "$ALPHAFOLD3_ID"/"$ALPHAFOLD3_ID"_summary_confidences.json ] || continue
+                      [ $(( `date +%s` - `stat -c %Y "$RANK"` )) -ge {params.zip_settle_s} ] || continue
+                      if zip_pool "$ALPHAFOLD3_ID"; then
+                          echo "$ALPHAFOLD3_ID" >> $ZIPPED_LIST
+                          echo ZIPPED_EARLY: "$ALPHAFOLD3_ID" `date -Is`
+                      fi
+                  done
+                  [ -f $TMPDIR/container.finished ] && break
+                  sleep 30
+              done ) &
+            ZIPPER_PID=$!
+
             echo CONTAINER_START: `date -Is`
             CONTAINER_RC=0
-            singularity exec --nv --writable-tmpfs \
-                {params.singularity_args} \
-                {params.bind_input} \
-                {params.bind_output} \
-                {params.bind_models} \
-                {params.bind_databases} \
-                {params.bind_scripts} \
-                {params.container} \
+            singularity exec --nv --writable-tmpfs \\
+                {params.singularity_args} \\
+                {params.bind_input} \\
+                {params.bind_output} \\
+                {params.bind_models} \\
+                {params.bind_databases} \\
+                {params.bind_scripts} \\
+                {params.container} \\
                 sh -c '/app/scripts/{params.run_alphafold_wrapper} {params.run_alphafold_args} {params.run_alphafold_dirs}' || CONTAINER_RC=$?
             echo CONTAINER_END: `date -Is` rc=$CONTAINER_RC
+            touch $TMPDIR/container.finished
+            wait $ZIPPER_PID || true
             cd -
 
-            # one zip per pool that produced a summary; a pool without one stays without a zip (= failed, re-batched
-            # by the next run). The batch marker lists every pool's status.
+            # the rest: one zip per pool that produced a summary and was not zipped early; a pool without a summary
+            # stays without a zip (= failed, re-batched by the next run). The batch marker lists every pool's status.
             cd $TMPDIR/alphafold3_predictions
             N_OK=0
-            : > $SMKDIR/{output.done}.tmp
-            for ALPHAFOLD3_ID in $ALPHAFOLD3_IDS; do
-                if [ -f "$ALPHAFOLD3_ID"/"$ALPHAFOLD3_ID"_summary_confidences.json ]; then
-                    OUT_DATA="$ALPHAFOLD3_ID"/"$ALPHAFOLD3_ID"_data.json
-                    [ -f "$OUT_DATA" ] && rm "$OUT_DATA"
+            for ALPHAFOLD3_ID in $TODO_IDS; do
+                if grep -qx "$ALPHAFOLD3_ID" $ZIPPED_LIST; then
+                    N_OK=$((N_OK + 1)); echo "POOL_STATUS $ALPHAFOLD3_ID ok" >> $MARKER_TMP
+                elif [ -f "$ALPHAFOLD3_ID"/"$ALPHAFOLD3_ID"_summary_confidences.json ]; then
                     echo Compressing predictions to $SMKDIR/alphafold3_predictions/$ALPHAFOLD3_ID.zip
-                    zip -q -r $SMKDIR/alphafold3_predictions/$ALPHAFOLD3_ID.zip.tmp $ALPHAFOLD3_ID \
-                        && mv $SMKDIR/alphafold3_predictions/$ALPHAFOLD3_ID.zip.tmp $SMKDIR/alphafold3_predictions/$ALPHAFOLD3_ID.zip \
-                        && N_OK=$((N_OK + 1)) && echo "POOL_STATUS $ALPHAFOLD3_ID ok" >> $SMKDIR/{output.done}.tmp \
-                        || echo "POOL_STATUS $ALPHAFOLD3_ID zip_failed" >> $SMKDIR/{output.done}.tmp
+                    if zip_pool "$ALPHAFOLD3_ID"; then
+                        N_OK=$((N_OK + 1)); echo "POOL_STATUS $ALPHAFOLD3_ID ok" >> $MARKER_TMP
+                    else
+                        echo "POOL_STATUS $ALPHAFOLD3_ID zip_failed" | tee -a $MARKER_TMP
+                    fi
                 else
-                    echo "POOL_STATUS $ALPHAFOLD3_ID missing_output" | tee -a $SMKDIR/{output.done}.tmp
+                    echo "POOL_STATUS $ALPHAFOLD3_ID missing_output" | tee -a $MARKER_TMP
                 fi
             done
-            echo BATCH_DONE: ok=$N_OK of `echo $ALPHAFOLD3_IDS | wc -w` container_rc=$CONTAINER_RC
+            echo BATCH_DONE: ok=$N_OK of `echo $TODO_IDS | wc -w` container_rc=$CONTAINER_RC early=`wc -l < $ZIPPED_LIST`
             if [ "$N_OK" -eq 0 ] && [ "$CONTAINER_RC" -ne 0 ]; then
                 echo "ERROR: the container failed (rc $CONTAINER_RC) and no pool produced output" >&2
-                rm -f $SMKDIR/{output.done}.tmp
+                rm -f $MARKER_TMP
                 exit $CONTAINER_RC
             fi
-            mv $SMKDIR/{output.done}.tmp $SMKDIR/{output.done}
+            mv $MARKER_TMP $SMKDIR/{output.done}
         """
 
 rule alphafold3_datafill_predictions_batched:
     input:
-        expand(f'{MARK_DIR_}/batch{{batch_id}}.done', batch_id=sorted(batches_.batch_id.unique())),
+        markers_,

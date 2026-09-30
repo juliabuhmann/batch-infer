@@ -53,6 +53,10 @@ alphafold3:
     runtime_table_s: [[1600, 90], [3000, 110], [3500, 200], [4000, 260], [4500, 330]]
     disk_mb_per_pool: 2048
     disk_mb_min: 16384
+    # sbatch --ntasks of a batch job (mem_mb split over them): the kit's featurise / write-behind processes + the early zipper
+    threads: 4
+    # a pool is zipped beside the running container once its <id>_ranking_scores.csv is this old (seconds)
+    zip_settle_s: 30
   summary_ipsae:
     pae_cutoff: 10
     dist_cutoff: 10
