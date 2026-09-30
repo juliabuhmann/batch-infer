@@ -38,6 +38,21 @@ alphafold3:
     mem_mb: 98304
     disk_mb: 16384
     slurm_extra: '--gpus=a100:1'
+  # alphafold3_datafill_predictions_batched (workflow/targets/): N pools per GPU job, packed by predicted runtime.
+  # The table below is Anthropic's af3_torch kit (mode big) on the RTX PRO 6000, warm, N pools per process:
+  # 1600/3000 measured, 3500-4500 from single-call forward times + writing (UNVERIFIED as multi-pool; the
+  # BATCH_EST_MIN vs CONTAINER_START/END lines of the job logs calibrate it). Set per run for other engines/cards.
+  predictions_batched:
+    runtime: 4h
+    budget_hrs: 2.8
+    job_overhead_s: 180
+    max_pools_per_job: 40
+    tokens_min: 16
+    tokens_max: 4500
+    order: tokens_desc
+    runtime_table_s: [[1600, 90], [3000, 110], [3500, 200], [4000, 260], [4500, 330]]
+    disk_mb_per_pool: 2048
+    disk_mb_min: 16384
   summary_ipsae:
     pae_cutoff: 10
     dist_cutoff: 10
