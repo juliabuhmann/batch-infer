@@ -53,12 +53,14 @@ alphafold3:
     runtime_table_s: [[1600, 90], [3000, 110], [3500, 200], [4000, 260], [4500, 330]]
     disk_mb_per_pool: 2048
     disk_mb_min: 16384
-    # sbatch --ntasks of a batch job (mem_mb split over them): the kit's featurise / write-behind processes + the early zipper
-    threads: 4
+    # sbatch --ntasks of a batch job (mem_mb split over them). 1 = the setting of every clean run so far; 4 ran only in the two
+    # jobs that hit CUDA OOM on 4416/4480-token pools (confounded with early_zip and the bucket, not debugged) -- see the target
+    threads: 1
     # a pool is zipped beside the running container once its <id>_ranking_scores.csv is this old (seconds)
     zip_settle_s: 30
-    # false: no zipping beside the container (the rule of the first batched runs); a control switch
-    early_zip: true
+    # true: zip each pool beside the running container (a job cut by its time limit keeps its finished pools). Off by default:
+    # the two jobs that ran with it on are the two that hit CUDA OOM (see threads); keep budget_hrs well below runtime while off
+    early_zip: false
   summary_ipsae:
     pae_cutoff: 10
     dist_cutoff: 10

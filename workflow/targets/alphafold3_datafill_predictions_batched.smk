@@ -46,8 +46,12 @@ listing each pool's status), NOT the zips: snakemake removes the outputs of a fa
 finished pools' zips along with the failed pool's. <digest> is a hash of the batch's pool ids, so a batch list
 regenerated after a partial run (batch numbers start at 0 again, over other pools) never matches an old marker.
 
-STATUS 2026-09-30: batch packing and the one-container-per-batch flow ran (8 pools, job 15714071; 1 + 19 + 19 pools,
-jobs 15721990/88/89). The early zipper, the zip-exists skip, the digest markers and `threads` are NOT yet run.
+STATUS 2026-10-01: production on the RTX PRO 6000 with Anthropic's af3_torch kit, threads 1 and early_zip false (the defaults):
+500-pool Zhang run, 18 jobs x 27 pools of 4481-4500 tokens, 0 failures, 4.9 min of GPU per pool, peak 62.5 GiB flat, estimate 8%
+low. The one-fill-per-job call, the digest markers and the already-zipped skip ran there. OPEN: with threads 4 + early_zip true,
+pools of 4399-4480 tokens hit CUDA OOM in a multi-pool process twice (2/5, 3/5 items at >92 GiB; the same pools alone peak at
+60.8 GiB) -- confounded between those two settings and the token bucket, the separating control (same pools, threads 1,
+early_zip false) has not run. Until it has: tokens_min at the bucket boundary for the batched pass, the one-pool target for the rest.
 """
 
 include: '../rules/common.smk'
