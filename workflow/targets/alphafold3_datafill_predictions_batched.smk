@@ -48,10 +48,10 @@ regenerated after a partial run (batch numbers start at 0 again, over other pool
 
 STATUS 2026-10-01: production on the RTX PRO 6000 with Anthropic's af3_torch kit, threads 1 and early_zip false (the defaults):
 500-pool Zhang run, 18 jobs x 27 pools of 4481-4500 tokens, 0 failures, 4.9 min of GPU per pool, peak 62.5 GiB flat, estimate 8%
-low. The one-fill-per-job call, the digest markers and the already-zipped skip ran there. OPEN: with threads 4 + early_zip true,
-pools of 4399-4480 tokens hit CUDA OOM in a multi-pool process twice (2/5, 3/5 items at >92 GiB; the same pools alone peak at
-60.8 GiB) -- confounded between those two settings and the token bucket, the separating control (same pools, threads 1,
-early_zip false) has not run. Until it has: tokens_min at the bucket boundary for the batched pass, the one-pool target for the rest.
+low; the one-fill-per-job call, the digest markers and the already-zipped skip ran there. RESOLVED: with threads 4 + early_zip
+true, pools of 4399-4424 tokens hit CUDA OOM in a multi-pool process twice (2/5 and 3/5 items at >92 GiB, survivors 83-89 GiB);
+the same five pools with threads 1 + early_zip false passed in one process at 59-61 GiB (job 15751162), as they do alone. Which
+of the two settings does it was not separated; both stay off. Re-run that control before turning either on.
 """
 
 include: '../rules/common.smk'
