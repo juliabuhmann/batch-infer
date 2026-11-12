@@ -46,3 +46,15 @@ Tested only on the **NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB)** on E
    batch-infer start alphafold3_datafill_predictions_batched <run dir>
    ```
    The batching values in the example were measured on the RTX PRO 6000. For other GPUs, re-measure `runtime_table_s`. Pools over `tokens_max` are listed in `alphafold3_predictions/.alphafold3_datafill_predictions_batched.tsv.refused`.
+
+### Provenance
+
+Each batch job that runs the container writes `alphafold3_predictions/.provenance/<SLURM job id>.json`:
+- node and GPUs (`nvidia-smi` on the host);
+- the container path, its labels (OCI digest), and the sha256 from `<image>.sha256` next to the image, if that file exists (create it once with `sha256sum <image> > <image>.sha256`);
+- the batch-infer commit and whether the checkout had uncommitted changes;
+- sha256 of the wrapper and of `config.yaml`, and the prediction settings;
+- the fill and container timestamps and the container return code;
+- per pool: its status, tokens, and the engine's `ITEM`/`PHASE` lines (the af3_torch kit prints run time, bucket and peak memory per input).
+
+There is one file per job, so jobs running in parallel never write the same file. A failure to write the record is printed (`PROVENANCE_FAILED`) and does not fail the job.

@@ -1,5 +1,6 @@
 
 include: '../rules/common.smk'
+import shlex
 
 include: 'alphafold3_datafill_msas.smk'
 
@@ -14,8 +15,14 @@ include: 'alphafold3_datafill_msas.smk'
 # zips: snakemake deletes the outputs of a failed job, which would remove the zips of the pools that did finish.
 # Zips are written atomically, pools that already have a zip are skipped, and a job with any pool lacking output
 # exits non-zero (no marker), so re-running the target runs only what is missing.
+#
+# Provenance: every batch job that ran the container writes alphafold3_predictions/.provenance/<SLURM_JOB_ID>.json
+# (workflow/scripts/write_provenance.py): node, GPUs, container path/labels/sha256, batch-infer commit, wrapper and
+# config.yaml sha256, settings, timestamps, and per pool its status, tokens and the engine's ITEM/PHASE lines.
+# One file per job, so parallel jobs and parallel run directories never write the same file.
 BATCHES_TSV_ = 'alphafold3_predictions/.alphafold3_datafill_predictions_batched.tsv'
 MARKER_DIR_ = 'alphafold3_predictions/.batches'
+PROVENANCE_SETTINGS_ = shlex.quote(json.dumps({k: config['alphafold3'].get(k) for k in ('container', 'model_dir', 'predictions', 'predictions_batched')}, default=str))
 BATCHING_ = config['alphafold3'].get('predictions_batched') or {}
 # keys of an earlier version of this target; only the behaviour of their values below is implemented
 if int(BATCHING_.get('threads', 1)) != 1 or BATCHING_.get('early_zip', False):
@@ -100,6 +107,14 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             drop_data = 'true' if config['alphafold3']['predictions'].get('drop_data', True) else 'false',
             # predicted runtime of the batch in minutes (nan without a runtime table), compare with CONTAINER_START/END
             est_min = round(df_batch.runtime_s.sum() / 60, 1),
+            # provenance record of this job (write_provenance.py)
+            write_provenance = root_path('workflow/scripts/write_provenance.py'),
+            wrapper_path = root_path(f"workflow/scripts/{config['alphafold3']['predictions']['run_alphafold_wrapper']}"),
+            code_root = root_path('.'),
+            provenance_settings = PROVENANCE_SETTINGS_,
+            batches_tsv = BATCHES_TSV_,
+            rule_name = f'alphafold3_datafill_predictions_batched{batch_id}_{len(df_batch)}',
+            batch_id = batch_id,
         retries: config['alphafold3']['predictions']['retries']
         resources:
             runtime = BATCHING_.get('runtime') or config['alphafold3']['predictions']['runtime'],
@@ -112,6 +127,7 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
         shell: """
             source {params.activate}
             SMKDIR=`pwd`
+            JOB_START=`date -Is`
             echo BATCH: {params.alphafold3_ids}
             echo BATCH_EST_MIN: {params.est_min}
 
@@ -119,7 +135,7 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             ALPHAFOLD3_IDS=""
             for ALPHAFOLD3_ID in {params.alphafold3_ids}; do
                 if [ -f $SMKDIR/alphafold3_predictions/"$ALPHAFOLD3_ID".zip ]; then
-                    echo POOL_STATUS "$ALPHAFOLD3_ID" already_zipped
+                    echo POOL_STATUS "$ALPHAFOLD3_ID" already_zipped | tee -a $TMPDIR/pool_status.txt
                 else
                     ALPHAFOLD3_IDS="$ALPHAFOLD3_IDS $ALPHAFOLD3_ID"
                 fi
@@ -136,23 +152,26 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             for ALPHAFOLD3_ID in $ALPHAFOLD3_IDS; do
                 ln -sfn $SMKDIR/alphafold3_jsons/"$ALPHAFOLD3_ID".json $TMPDIR/alphafold3_jsons/"$ALPHAFOLD3_ID".json
             done
-            echo FILL_START: `date -Is`
+            FILL_START=`date -Is`; echo FILL_START: $FILL_START
             af3io data-fill {params.data_sources} --data_dir=alphafold3_msas --input_dir=$TMPDIR/alphafold3_jsons --output_dir=$TMPDIR/alphafold3_msas/
-            echo FILL_END: `date -Is`
+            FILL_END=`date -Is`; echo FILL_END: $FILL_END
             ls -l $TMPDIR/alphafold3_msas
 
             mkdir -p $TMPDIR/alphafold3_predictions $TMPDIR/alphafold_cache
             cd $TMPDIR
             echo Contents of $TMPDIR
             ls -l $TMPDIR
-            echo CONTAINER_START: `date -Is`
+            CONTAINER_START=`date -Is`; echo CONTAINER_START: $CONTAINER_START
             CONTAINER_RC=0
+            # the container's output also goes to container.log, read by write_provenance.py (pipefail keeps its rc)
+            set -o pipefail
             singularity exec --nv --writable-tmpfs \
                 {params.singularity_args} \
                 {params.singularity_bind} \
                 {params.container} \
-                sh -c '/app/scripts/{params.run_alphafold_wrapper} {params.run_alphafold_args} {params.run_alphafold_dirs}' || CONTAINER_RC=$?
-            echo CONTAINER_END: `date -Is` rc=$CONTAINER_RC
+                sh -c '/app/scripts/{params.run_alphafold_wrapper} {params.run_alphafold_args} {params.run_alphafold_dirs}' 2>&1 \
+                | tee $TMPDIR/container.log || CONTAINER_RC=$?
+            CONTAINER_END=`date -Is`; echo CONTAINER_END: $CONTAINER_END rc=$CONTAINER_RC
             cd -
 
             # one zip per pool with a summary; .zip.tmp + mv so an interrupted job never leaves a partial zip
@@ -160,7 +179,7 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
             N_FAILED=0
             for ALPHAFOLD3_ID in $ALPHAFOLD3_IDS; do
                 if [ ! -f "$ALPHAFOLD3_ID"/"$ALPHAFOLD3_ID"_summary_confidences.json ]; then
-                    echo POOL_STATUS "$ALPHAFOLD3_ID" missing_output
+                    echo POOL_STATUS "$ALPHAFOLD3_ID" missing_output | tee -a $TMPDIR/pool_status.txt
                     N_FAILED=$((N_FAILED + 1))
                     continue
                 fi
@@ -172,14 +191,21 @@ for batch_id, df_batch in batches_.groupby('batch_id'):
                 echo Compressing predictions to $SMKDIR/alphafold3_predictions/$ALPHAFOLD3_ID.zip
                 if zip -q -r $SMKDIR/alphafold3_predictions/"$ALPHAFOLD3_ID".zip.tmp "$ALPHAFOLD3_ID" \
                     && mv $SMKDIR/alphafold3_predictions/"$ALPHAFOLD3_ID".zip.tmp $SMKDIR/alphafold3_predictions/"$ALPHAFOLD3_ID".zip; then
-                    echo POOL_STATUS "$ALPHAFOLD3_ID" ok
+                    echo POOL_STATUS "$ALPHAFOLD3_ID" ok | tee -a $TMPDIR/pool_status.txt
                 else
-                    echo POOL_STATUS "$ALPHAFOLD3_ID" zip_failed
+                    echo POOL_STATUS "$ALPHAFOLD3_ID" zip_failed | tee -a $TMPDIR/pool_status.txt
                     N_FAILED=$((N_FAILED + 1))
                 fi
             done
             cd -
             echo BATCH_DONE: failed=$N_FAILED of `echo $ALPHAFOLD3_IDS | wc -w` container_rc=$CONTAINER_RC
+            python {params.write_provenance} --run-dir $SMKDIR --rule {params.rule_name} --batch-id {params.batch_id} \
+                --ids "{params.alphafold3_ids}" --batches-tsv $SMKDIR/{params.batches_tsv} \
+                --container {params.container} --wrapper {params.wrapper_path} --code-root {params.code_root} \
+                --settings {params.provenance_settings} \
+                --container-log $TMPDIR/container.log --pool-status $TMPDIR/pool_status.txt --container-rc $CONTAINER_RC \
+                --times "job_start=$JOB_START fill_start=$FILL_START fill_end=$FILL_END container_start=$CONTAINER_START container_end=$CONTAINER_END job_end=`date -Is`" \
+                || echo PROVENANCE_FAILED
             if [ "$N_FAILED" -gt 0 ]; then
                 echo "ERROR: $N_FAILED pool(s) without a zip; re-run the target to retry them" >&2
                 exit 1
